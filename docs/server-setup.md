@@ -169,6 +169,7 @@ sudo ufw status verbose
 | 02-keys-configured | после создания devops и настройки входа по ключу (задание 1)|
 | 03-ssh-hardened | после усиления SSH и смены порта на 2222 (задание 2)  |
 | 04-nginx-https | после установки Nginx и перевода ресурса на HTTPS (ПР № 6, задание 2) |
+| 05-docker-compose | после установки Docker Engine и запуска проекта «приложение + СУБД» (ПР № 7, задание 2) |
 
 ## 8. Веб-сервер
 
@@ -247,3 +248,79 @@ scripts/deploy.sh                                     # требуется GNU r
 ```
 
 Снимок состояния: `04-nginx-https` — после перевода ресурса на HTTPS (задание 2 ПР № 6).
+
+## 9. Контейнеризация
+
+| Параметр | Значение |
+|---|---|
+| Docker Engine | из официального репозитория `download.docker.com` (не пакет `docker.io`); на стенде Docker Engine 29.9.3, containerd v2.4.2, Docker Compose v5.7.0 |
+| Репозиторий APT | `/etc/apt/sources.list.d/docker.sources`, ключ `/etc/apt/keyrings/docker.asc`, Suites — кодовое имя Ubuntu (`resolute`) |
+| Группа `docker` | только `devops` (у неё есть право sudo); учётные записи без sudo в группу не добавляются: участник группы фактически получает права root |
+| Проект на сервере | `~/app` (`/home/devops/app`), владелец `devops`, доставляется с хоста из каталога `app/` репозитория через rsync с `--exclude=.env` |
+| Файл `.env` | `~/app/.env`, `devops:devops`, права 600, создаётся только на сервере из `.env.example`, пароль СУБД — `openssl rand -hex 16`; в репозиторий и на хост не копируется (`.env` в `.gitignore` и `.dockerignore`) |
+| Сервисы | `app` — образ `devops-app:1.0` (python:3.12-slim, gunicorn, процесс от пользователя `app`); `db` — `postgres:16-alpine` с проверкой `pg_isready` |
+| Сеть | пользовательская сеть `app_backend` (bridge); приложение обращается к СУБД по имени `db` |
+| Публикуемые порты | `127.0.0.1:5000` → `app:5000` (только для Nginx на той же машине); порт СУБД 5432 не публикуется |
+| Именованный том | `app_db_data` → `/var/lib/postgresql/data` (на сервере `/var/lib/docker/volumes/app_db_data/_data`); `docker compose down -v` удаляет данные безвозвратно |
+| Обратный прокси | `location /app/` в HTTPS-блоке `/etc/nginx/sites-available/devops-site`, `proxy_pass http://127.0.0.1:5000/` |
+| Перезапуск | `restart: unless-stopped` у обоих сервисов: после перезагрузки ВМ контейнеры поднимаются вместе со службой docker |
+
+Установка Docker Engine **[VM]** (по https://docs.docker.com/engine/install/ubuntu/):
+```bash
+sudo apt-get update && sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+sudo tee /etc/apt/sources.list.d/docker.sources <<SRC
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+SRC
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker devops      # затем новая SSH-сессия
+docker run --rm hello-world
+```
+
+Доставка проекта **[HOST]** (из корня репозитория):
+```bash
+rsync -avz --delete --exclude=.env app/ devops-vm:app/
+```
+
+Файл `.env` и запуск **[VM]**:
+```bash
+cd ~/app
+cp .env.example .env
+chmod 600 .env
+sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 16)/" .env
+docker compose up -d --build
+docker compose ps                          # db: (healthy)
+sudo ss -tlnp | grep -E ':(5000|5432)\b'   # только 127.0.0.1:5000
+```
+
+Обратный прокси **[VM]** — добавить в блок `server` на порту 443 после `location /`:
+```nginx
+    location /app/ {
+        proxy_pass http://127.0.0.1:5000/;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+```
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Проверка **[HOST]**:
+```bash
+curl --cacert ~/devops.crt https://devops.local/app/         # Hello from Docker, ...! Visits: N
+curl --cacert ~/devops.crt -I https://devops.local/          # статический ресурс, 200 OK
+```
+
+Порт приложения на `0.0.0.0` не публикуется: правила DNAT, которые Docker добавляет в iptables, обрабатываются раньше правил UFW, и такой порт доступен из сети при отсутствии разрешающего правила UFW. Ответ `502 Bad Gateway` на `/app/` означает, что Nginx не может подключиться к `127.0.0.1:5000`: проверить `docker compose ps` и `/var/log/nginx/devops-site.error.log`.
+
+Снимок состояния: `05-docker-compose` — после запуска проекта (задание 2 ПР № 7).
