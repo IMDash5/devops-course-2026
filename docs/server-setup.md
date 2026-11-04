@@ -168,3 +168,82 @@ sudo ufw status verbose
 | 01-clean-install | после установки Ubuntu Server и `apt upgrade`, ВМ выключена |
 | 02-keys-configured | после создания devops и настройки входа по ключу (задание 1)|
 | 03-ssh-hardened | после усиления SSH и смены порта на 2222 (задание 2)  |
+| 04-nginx-https | после установки Nginx и перевода ресурса на HTTPS (ПР № 6, задание 2) |
+
+## 8. Веб-сервер
+
+| Параметр | Значение |
+|---|---|
+| Пакет | `nginx` из репозитория Ubuntu (на стенде nginx/1.28.3) |
+| Конфигурация ресурса | `/etc/nginx/sites-available/devops-site`, ссылка в `/etc/nginx/sites-enabled/` |
+| Стандартный ресурс | отключён: удалена ссылка `/etc/nginx/sites-enabled/default`, файл в `sites-available` сохранён |
+| Каталог ресурса | `/var/www/devops-site`, владелец `devops:devops`, каталоги 755, файлы 644 |
+| Сертификат | `/etc/ssl/certs/devops.crt`, `root:root`, 644, самоподписанный, CN и SAN `DNS:devops.local`, срок 365 дней |
+| Закрытый ключ | `/etc/ssl/private/devops.key`, `root:root`, 600, RSA 2048, без пароля; в репозиторий не добавляется |
+| Журналы | `/var/log/nginx/devops-site.access.log`, `/var/log/nginx/devops-site.error.log` (запросы на порт 80 — в общий `/var/log/nginx/access.log`) |
+| Порты | 80 (перенаправление 301 на HTTPS), 443 (TLSv1.2, TLSv1.3); правила UFW из раздела 6 |
+| Доставка содержимого | `scripts/deploy.sh` из каталога `site/` репозитория (rsync `--delete --chmod=D755,F644`) |
+
+Установка **[VM]**:
+```bash
+sudo apt update && sudo apt install -y nginx
+sudo mkdir -p /var/www/devops-site
+sudo chown -R devops:devops /var/www/devops-site
+```
+
+Сертификат **[VM]** (срок действия 365 дней; перевыпуск — той же командой, затем reload):
+```bash
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/private/devops.key \
+  -out /etc/ssl/certs/devops.crt \
+  -subj "/CN=devops.local" \
+  -addext "subjectAltName=DNS:devops.local"
+sudo chmod 600 /etc/ssl/private/devops.key
+```
+
+Конфигурация ресурса **[VM]**:
+```bash
+sudo tee /etc/nginx/sites-available/devops-site > /dev/null <<'CONF'
+server {
+    listen 80;
+    listen [::]:80;
+    server_name devops.local;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name devops.local;
+
+    ssl_certificate     /etc/ssl/certs/devops.crt;
+    ssl_certificate_key /etc/ssl/private/devops.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    root /var/www/devops-site;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    error_page 404 /404.html;
+
+    access_log /var/log/nginx/devops-site.access.log;
+    error_log  /var/log/nginx/devops-site.error.log;
+}
+CONF
+sudo ln -s /etc/nginx/sites-available/devops-site /etc/nginx/sites-enabled/
+sudo rm /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+```
+Изменения конфигурации применяются только `sudo nginx -t && sudo systemctl reload nginx` (не `restart`). Заголовок HSTS не добавляется.
+
+Хост **[HOST]**: сертификат копируется для проверки клиентом, затем содержимое доставляется сценарием:
+```bash
+scp devops-vm:/etc/ssl/certs/devops.crt ~/devops.crt
+curl --cacert ~/devops.crt -I https://devops.local   # 200 OK без -k
+scripts/deploy.sh                                     # требуется GNU rsync (macOS: brew install rsync)
+```
+
+Снимок состояния: `04-nginx-https` — после перевода ресурса на HTTPS (задание 2 ПР № 6).
